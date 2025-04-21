@@ -6,11 +6,12 @@ services:
       dockerfile: ./docker/Dockerfile
     network_mode: host
     environment:
-      CONFIG_FILE: /app/src/config.ini
+      CONFIG_FILE: /app/config.ini
     env_file:
       - .env
     volumes:
       - ../src:/app/src/
+      - ../config.ini:/app/config.ini
 
   opensips:
     container_name: ai-voice-connector-opensips
