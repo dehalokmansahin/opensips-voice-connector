@@ -86,7 +86,6 @@ def indialog(params):
 
 def get_user(params):
     """ Returns the User from the SIP headers """
-
     to = get_to(params)
     return to.uri.user.lower() if to.uri else None
 

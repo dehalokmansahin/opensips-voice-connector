@@ -27,6 +27,7 @@ import logging
 import asyncio
 import json
 import websockets  # Import the websockets library
+import time
 
 from ai import AIEngine
 from config import Config
@@ -35,6 +36,46 @@ from codec import get_codecs, CODECS, UnsupportedCodec
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+class FlowControl:
+    """Implements a token bucket algorithm for flow control"""
+    
+    def __init__(self, rate=50, capacity=100):
+        """Initialize flow control with rate tokens per second"""
+        self.rate = rate  # tokens per second
+        self.capacity = capacity
+        self.tokens = capacity
+        self.last_update = time.time()
+        self.connection_health = 1.0  # 0.0-1.0 reflecting connection health
+        self.lock = asyncio.Lock()
+    
+    async def consume(self, tokens=1):
+        """Consume tokens, waiting if necessary. Returns True when tokens are consumed."""
+        async with self.lock:
+            now = time.time()
+            # Replenish tokens based on elapsed time
+            elapsed = now - self.last_update
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate * self.connection_health)
+            self.last_update = now
+            
+            if tokens <= self.tokens:
+                # We have enough tokens
+                self.tokens -= tokens
+                return 0  # No wait needed
+            else:
+                # Not enough tokens, calculate wait time
+                wait_time = (tokens - self.tokens) / (self.rate * self.connection_health)
+                self.tokens = 0
+                return wait_time
+    
+    def connection_error(self):
+        """Signal a connection issue to slow down the rate"""
+        self.connection_health = max(0.2, self.connection_health * 0.7)
+        logger.info(f"Flow control: reducing to {self.connection_health*100:.1f}% of normal rate")
+    
+    def connection_success(self):
+        """Signal successful operation to gradually increase the rate"""
+        self.connection_health = min(1.0, self.connection_health * 1.05)
 
 class VoskSTT(AIEngine):
     """ Implements Vosk WebSocket communication """
@@ -62,14 +103,24 @@ class VoskSTT(AIEngine):
         self.codec = self.choose_codec(call.sdp) # Determine codec early
         logger.info(f"Chosen Codec: {self.codec.name}@{self.codec.sample_rate}Hz (Target Vosk Rate: {self.sample_rate}Hz)")
 
-        self.websocket: websockets.WebSocketClientProtocol | None = None
+        self.websocket = None
         self.connection_task = None
         self.receive_task = None
+        self.send_task = None
         self.send_queue = asyncio.Queue() # Queue for audio data to send
         self.transcription_queue = asyncio.Queue() # Queue for received transcriptions
         self.is_active = False
         self.stop_event = asyncio.Event() # To signal stopping tasks
-
+        
+        # Initialize flow control with target packet rate based on sample rate
+        # Assuming 20ms packets, calculate rate: 1000ms/20ms = 50 packets per second
+        packet_rate = 1000 / 20  # 50 packets per second for 20ms chunks
+        self.flow_control = FlowControl(rate=packet_rate, capacity=packet_rate)
+        
+        # Error tracking for adaptive backoff
+        self.consecutive_errors = 0
+        self.last_error_time = 0
+        self.reconnection_attempts = 0
 
         # Placeholder for potential integration with a ChatGPT or similar component
         # self.chat_handler = ... # Initialize if needed based on project pattern
@@ -118,6 +169,11 @@ class VoskSTT(AIEngine):
                 self.websocket = await websockets.connect(self.vosk_server_url)
                 logger.info(f"Connected to Vosk server for call {self.b2b_key}")
                 
+                # Reset error counters on successful connection
+                self.consecutive_errors = 0
+                self.reconnection_attempts = 0
+                self.flow_control.connection_success()
+                
                 # Send configuration message immediately after connecting
                 config_message = json.dumps({
                     "config": {
@@ -155,6 +211,8 @@ class VoskSTT(AIEngine):
                         logger.info(f"Task was cancelled for call {self.b2b_key}")
                     except Exception as e:
                         logger.error(f"Task failed with error for call {self.b2b_key}: {e}")
+                        self.consecutive_errors += 1
+                        self.flow_control.connection_error()
                 
                 if self.stop_event.is_set():
                     logger.info(f"Stop event set, not reconnecting for call {self.b2b_key}")
@@ -167,11 +225,15 @@ class VoskSTT(AIEngine):
                     logger.info(f"Connection closed while stopping, exiting for call {self.b2b_key}")
                     break
                 logger.warning(f"Vosk WebSocket connection closed for call {self.b2b_key}: {e}")
+                self.consecutive_errors += 1
+                self.flow_control.connection_error()
             except Exception as e:
                 if self.stop_event.is_set():
                     logger.info(f"Exception while stopping, exiting for call {self.b2b_key}")
                     break
                 logger.error(f"Error in Vosk WebSocket connection for call {self.b2b_key}: {e}")
+                self.consecutive_errors += 1
+                self.flow_control.connection_error()
             
             # Clean up the WebSocket
             if self.websocket:
@@ -184,8 +246,13 @@ class VoskSTT(AIEngine):
             
             # If we're still active, implement reconnection backoff
             if self.is_active and not self.stop_event.is_set():
-                retry_delay = 1.0  # Start with 1 second
-                logger.info(f"Reconnecting to Vosk server in {retry_delay}s...")
+                self.reconnection_attempts += 1
+                # Exponential backoff with jitter
+                base_delay = min(1.0 * (1.5 ** min(self.reconnection_attempts, 10)), 30)
+                jitter = 0.1 * base_delay * (asyncio.get_event_loop().time() % 1.0)
+                retry_delay = base_delay + jitter
+                
+                logger.info(f"Reconnecting to Vosk server in {retry_delay:.2f}s... (attempt {self.reconnection_attempts})")
                 try:
                     await asyncio.wait_for(self.stop_event.wait(), timeout=retry_delay)
                     if self.stop_event.is_set():
@@ -201,18 +268,24 @@ class VoskSTT(AIEngine):
         """ Internal task to continuously send audio data from the queue """
         try:
             logger.info(f"Starting Vosk audio send loop for call {self.b2b_key}")
+            error_count = 0
+            success_count = 0
             
-            while self.is_active and not self.stop_event.is_set() and self.websocket.open:
+            while self.is_active and not self.stop_event.is_set() and self.websocket and not self.websocket.closed:
                 try:
                     # Get the next audio chunk from the queue with a timeout
                     # This allows us to check periodically if we should exit
                     audio_data = await asyncio.wait_for(self.send_queue.get(), timeout=0.5)
                     
+                    # Apply flow control
+                    wait_time = await self.flow_control.consume()
+                    if wait_time > 0:
+                        await asyncio.sleep(wait_time)
+                    
                     # Potentially decode the audio to match Vosk's expected format (PCM)
                     # Check if we need to decode based on the chosen codec
                     pcm_data = audio_data
                     if hasattr(self.codec, 'decode') and self.codec.sample_rate != self.sample_rate:
-                        # We may need to decode and potentially also resample here
                         try:
                             pcm_data = self.codec.decode(audio_data)
                             # Resampling would happen here if needed
@@ -225,21 +298,34 @@ class VoskSTT(AIEngine):
                     await self.websocket.send(pcm_data)
                     self.send_queue.task_done()
                     
+                    # Track success
+                    success_count += 1
+                    error_count = 0  # Reset error count on success
+                    
+                    # Periodically signal connection health
+                    if success_count % 100 == 0:
+                        self.flow_control.connection_success()
+                    
                 except asyncio.TimeoutError:
                     # Just a timeout on queue.get(), continue the loop
                     continue
                 except websockets.exceptions.ConnectionClosed as e:
                     logger.warning(f"WebSocket closed during send for call {self.b2b_key}: {e}")
                     # Let the _connect_and_manage method handle reconnection
-                    break
+                    raise
                 except Exception as e:
                     logger.error(f"Error in Vosk send loop for call {self.b2b_key}: {e}")
-                    # Continue the loop and try again, unless it's a critical error
-                    # If this error is happening repeatedly, _connect_and_manage will eventually reconnect
-                    await asyncio.sleep(0.1)  # Small delay to prevent error spam
+                    # Track consecutive errors for adaptive backoff
+                    error_count += 1
+                    if error_count >= 3:
+                        self.flow_control.connection_error()
+                        
+                    # Add increasing delay based on consecutive errors
+                    backoff_delay = min(0.1 * (2 ** min(error_count, 5)), 2.0)
+                    await asyncio.sleep(backoff_delay)
             
             # If we're shutting down, send the EOF marker to Vosk to finalize transcription
-            if self.websocket and self.websocket.open and not self.stop_event.is_set():
+            if self.websocket and not self.websocket.closed and not self.stop_event.is_set():
                 try:
                     logger.info(f"Sending EOF marker to Vosk for call {self.b2b_key}")
                     await self.websocket.send(json.dumps({"eof": 1}))
@@ -260,10 +346,13 @@ class VoskSTT(AIEngine):
             # Similar to how Deepgram implementation buffers text
             sentence_buffer = []
             
-            while self.is_active and not self.stop_event.is_set() and self.websocket.open:
+            while self.is_active and not self.stop_event.is_set() and self.websocket and not self.websocket.closed:
                 try:
                     # Receive the next message from Vosk
                     message = await self.websocket.recv()
+                    
+                    # Signal successful communication to flow control
+                    self.flow_control.connection_success()
                     
                     # Parse the JSON response
                     try:
@@ -309,11 +398,15 @@ class VoskSTT(AIEngine):
                 except websockets.exceptions.ConnectionClosed as e:
                     logger.warning(f"WebSocket closed during receive for call {self.b2b_key}: {e}")
                     # Let the _connect_and_manage method handle reconnection
-                    break
+                    raise
                 except Exception as e:
                     logger.error(f"Error in Vosk receive loop for call {self.b2b_key}: {e}")
-                    # Continue the loop and try again, unless it's a critical error
-                    await asyncio.sleep(0.1)  # Small delay to prevent error spam
+                    # Mark connection issue in flow control
+                    self.flow_control.connection_error()
+                    
+                    # Use adaptive backoff for errors
+                    backoff_delay = min(0.1 * (2 ** min(self.consecutive_errors, 5)), 2.0)
+                    await asyncio.sleep(backoff_delay)
             
             logger.info(f"Vosk transcription receive loop exiting for call {self.b2b_key}")
         except Exception as e:
@@ -359,7 +452,7 @@ class VoskSTT(AIEngine):
             # logger.debug(f"Vosk STT not active or stopping, ignoring audio data for call {self.b2b_key}")
             return # Don't queue if not running
 
-        if self.websocket and self.websocket.open:
+        if self.websocket and not self.websocket.closed:
              # If direct sending is preferred and connection is stable:
              # try:
              #     # Decode if necessary
@@ -399,7 +492,7 @@ class VoskSTT(AIEngine):
                  self.connection_task.cancel() # Ensure cancellation on other errors
 
         # Explicitly close websocket if connection_task didn't
-        if self.websocket and self.websocket.open:
+        if self.websocket and not self.websocket.closed:
             try:
                 await self.websocket.close(code=1000, reason='Client closing')
                 logger.info(f"Vosk WebSocket closed explicitly for call {self.b2b_key}")
