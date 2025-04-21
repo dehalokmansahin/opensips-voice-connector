@@ -6,7 +6,7 @@
          dockerfile: ./docker/Dockerfile
        ports:
          - "5070:5060/udp"  
-         - "35000-65000:35000-65000/udp"  # RTP portları
+         - "35000-40000:35000-40000/udp"  # RTP portları
        environment:
          CONFIG_FILE: /app/config.ini
        env_file:
@@ -14,10 +14,3 @@
        volumes:
          - ../src:/app/src/
          - ../config.ini:/app/config.ini
-       # Eğer özel bir network kullanacaksanız:
-       networks:
-         - opensips-network
-   
-   networks:
-     opensips-network:
-       external: true  # Mevcut bir network kullanıyorsanız
