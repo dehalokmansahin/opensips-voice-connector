@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Test script for direct WebSocket connection to Vosk server with audio file
+Vosk sunucusuna doğrudan bir WebSocket bağlantısı ile ses dosyası gönderen test betiği
 """
 
 import asyncio
@@ -12,17 +12,18 @@ import json
 import websockets
 import audioop
 
-# Configure logging
+# Loglamayı ayarla
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 async def test_vosk_with_wav(audio_file_path, vosk_url="ws://localhost:2700"):
-    """Test sending a WAV file directly to Vosk server via WebSocket"""
+    """Bir WAV dosyasını doğrudan WebSocket üzerinden Vosk sunucusuna gönderip test eder"""
     
     logger.info(f"Testing Vosk with audio file: {audio_file_path}")
     
     try:
-        # Open and validate WAV file
+        # WAV dosyasını aç ve doğrula
+        # GELİŞTİRİLEBİLİR: Bir bağlam yöneticisi (context manager) sınıfı oluşturarak ses dosyası işlemlerini daha sağlam hale getirebiliriz
         with wave.open(audio_file_path, 'rb') as wav_file:
             channels = wav_file.getnchannels()
             sample_width = wav_file.getsampwidth()
@@ -33,18 +34,20 @@ async def test_vosk_with_wav(audio_file_path, vosk_url="ws://localhost:2700"):
             logger.info(f"Channels: {channels}, Sample width: {sample_width} bytes")
             logger.info(f"Sample rate: {frame_rate} Hz, Duration: {frames/frame_rate:.2f} seconds")
             
-            # Vosk server expects 16000 Hz from config.ini
+            # Vosk sunucusu config.ini'den 16000 Hz bekliyor
+            # GELİŞTİRİLEBİLİR: Bu değeri config.ini dosyasından okuyarak hardcoded (sabit kodlanmış) olmasını önleyebiliriz
             target_sample_rate = 16000
             logger.info(f"Vosk expects sample rate: {target_sample_rate} Hz")
             needs_resample = frame_rate != target_sample_rate
             if needs_resample:
                 logger.info(f"Will resample from {frame_rate} Hz to {target_sample_rate} Hz")
             
-            # Connect to Vosk WebSocket server
+            # Vosk WebSocket sunucusuna bağlan
+            # GELİŞTİRİLEBİLİR: Bağlantı için daha sağlam bir hata yönetimi ve yeniden bağlanma mekanizması eklenebilir
             async with websockets.connect(vosk_url) as websocket:
                 logger.info(f"Connected to Vosk server at {vosk_url}")
                 
-                # Send configuration message with the target sample rate
+                # Hedef örnekleme oranı ile konfigürasyon mesajı gönder
                 config = {
                     "config": {
                         "sample_rate": target_sample_rate
@@ -53,15 +56,16 @@ async def test_vosk_with_wav(audio_file_path, vosk_url="ws://localhost:2700"):
                 await websocket.send(json.dumps(config))
                 logger.info(f"Sent configuration: {config}")
                 
-                # Create a task to receive messages
+                # Gelen mesajları almak için bir görev oluştur
+                # GELİŞTİRİLEBİLİR: Görev sonuçlarını toplama ve daha iyi analiz etme mekanizması eklenebilir
                 receive_task = asyncio.create_task(receive_messages(websocket))
                 
-                # Read audio in larger chunks (40ms instead of 20ms)
-                chunk_samples = int(frame_rate * 0.04)  # 40ms of samples
+                # Sesi daha büyük parçalar halinde oku (20ms yerine 40ms)
+                chunk_samples = int(frame_rate * 0.04)  # 40ms'lik örnekler
                 chunk_size = chunk_samples * channels * sample_width
                 chunk_count = 0
                 
-                # Wait a bit before starting to send audio
+                # Ses göndermeye başlamadan önce biraz bekle
                 await asyncio.sleep(0.5)
                 
                 while True:
@@ -69,13 +73,14 @@ async def test_vosk_with_wav(audio_file_path, vosk_url="ws://localhost:2700"):
                     if not audio_chunk:
                         break
                     
-                    # Handle audio format conversions if needed
+                    # Gerekiyorsa ses formatı dönüşümlerini yap
+                    # GELİŞTİRİLEBİLİR: Ses dönüştürme işlemlerini ayrı bir yardımcı fonksiyon olarak ayırarak kodu daha temiz hale getirebiliriz
                     if needs_resample:
-                        # Convert to mono if stereo
+                        # Stereo ise mono'ya dönüştür
                         if channels == 2:
                             audio_chunk = audioop.tomono(audio_chunk, sample_width, 0.5, 0.5)
                         
-                        # Resample to target rate
+                        # Hedef örnekleme oranına yeniden örnekle
                         audio_chunk = audioop.ratecv(
                             audio_chunk, 
                             sample_width, 
@@ -85,37 +90,40 @@ async def test_vosk_with_wav(audio_file_path, vosk_url="ws://localhost:2700"):
                             None
                         )[0]
                     
-                    # Only use mono channel for Vosk
+                    # Vosk için sadece mono kanal kullan
                     elif channels == 2:
                         audio_chunk = audioop.tomono(audio_chunk, sample_width, 0.5, 0.5)
                     
-                    # Send the processed audio chunk
+                    # İşlenmiş ses parçasını gönder
                     await websocket.send(audio_chunk)
                     chunk_count += 1
                     
                     if chunk_count % 25 == 0:
                         logger.info(f"Sent {chunk_count} chunks ({len(audio_chunk)} bytes in last chunk)")
                     
-                    # Match real-time audio flow (40ms chunks need 40ms delay)
+                    # Gerçek zamanlı ses akışını taklit et (40ms'lik parçalar için 40ms gecikme)
+                    # GELİŞTİRİLEBİLİR: Akış kontrolü için token bucket algoritması gibi daha gelişmiş bir yöntem kullanılabilir
                     await asyncio.sleep(0.04)
                     
-                    # Add additional pause every 10 chunks to let server catch up
+                    # Her 10 parçada bir sunucunun yetişmesi için ek duraklama ekle
                     if chunk_count % 10 == 0:
-                        await asyncio.sleep(0.02)  # Extra 20ms pause
+                        await asyncio.sleep(0.02)  # Ekstra 20ms duraklama
                 
                 logger.info(f"Finished sending {chunk_count} audio chunks")
                 
-                # Wait a moment before sending EOF
+                # EOF göndermeden önce biraz bekle
                 await asyncio.sleep(0.5)
                 
-                # Send EOF to finalize
+                # Bitirmek için EOF gönder
+                # GELİŞTİRİLEBİLİR: EOF gönderme ve sonuçları bekleme sürecinde daha dikkatli hata yönetimi yapılabilir
                 await websocket.send(json.dumps({"eof": 1}))
                 logger.info("Sent EOF marker")
                 
-                # Wait for final results
+                # Son sonuçları bekle
                 await asyncio.sleep(3)
                 
-                # Cancel the receive task
+                # receive_task görevini iptal et
+                # GELİŞTİRİLEBİLİR: Görev sonuçlarını işleyebilir ve gerekli bilgileri toplayabiliriz
                 receive_task.cancel()
                 try:
                     await receive_task
@@ -132,7 +140,7 @@ async def test_vosk_with_wav(audio_file_path, vosk_url="ws://localhost:2700"):
         return False
 
 async def receive_messages(websocket):
-    """Receive and process messages from the Vosk server"""
+    """Vosk sunucusundan gelen mesajları al ve işle"""
     try:
         while True:
             message = await websocket.recv()
@@ -141,7 +149,7 @@ async def receive_messages(websocket):
                 if "text" in result and result["text"]:
                     logger.info(f"💬 Transcription: {result['text']}")
                 elif "partial" in result and result["partial"]:
-                    if len(result["partial"]) > 5:  # Only log meaningful partials
+                    if len(result["partial"]) > 5:  # Sadece anlamlı kısmi sonuçları logla
                         logger.info(f"🔄 Partial: {result['partial']}")
                 else:
                     logger.info(f"Received: {message}")
@@ -151,11 +159,12 @@ async def receive_messages(websocket):
         logger.info("Receive task cancelled")
         raise
     except Exception as e:
+        # GELİŞTİRİLEBİLİR: Hata mesajları toplanabilir ve daha sonra analiz edilebilir
         logger.error(f"Error in receive task: {e}")
 
 async def main():
-    """Run the test"""
-    # Get audio file path from command line or use default
+    """Testi çalıştır"""
+    # Komut satırından ses dosyası yolunu al veya varsayılanı kullan
     audio_file = sys.argv[1] if len(sys.argv) > 1 else "test_l16_16k.wav"
     
     if not os.path.exists(audio_file):
@@ -170,7 +179,7 @@ async def main():
     else:
         logger.error("❌ Vosk test failed!")
     
-    # Exit with appropriate code
+    # Uygun çıkış kodu ile çık
     sys.exit(0 if result else 1)
 
 if __name__ == "__main__":
