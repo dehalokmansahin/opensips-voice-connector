@@ -6,7 +6,7 @@ WORKDIR /app
 COPY . /app/
 
 # Gereksinimleri yükle
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r ../requirements.txt
 
 # SIP ve RTP için portları tanımla
 EXPOSE 5060/udp
