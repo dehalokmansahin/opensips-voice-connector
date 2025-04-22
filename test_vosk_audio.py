@@ -16,7 +16,7 @@ import audioop
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-async def test_vosk_with_wav(audio_file_path, vosk_url="ws://localhost:2700"):
+async def test_vosk_with_wav(audio_file_path, vosk_url="ws://vosk-server.ai-gateway.svc.cluster.local:2700"):
     """Bir WAV dosyasını doğrudan WebSocket üzerinden Vosk sunucusuna gönderip test eder"""
     
     logger.info(f"Testing Vosk with audio file: {audio_file_path}")
