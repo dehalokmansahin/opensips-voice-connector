@@ -1,20 +1,21 @@
 FROM python:3.10-slim-buster
 
+# Çalışma dizini
 WORKDIR /app
 
-# Uygulamayı kopyala
+# Tüm proje dosyalarını (src, requirements.txt, config.ini vs.) kopyala
 COPY . /app/
 
 # Gereksinimleri yükle
-RUN pip install --no-cache-dir -r ../requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# SIP ve RTP için portları tanımla
+# Gerekli portlar
 EXPOSE 5060/udp
 EXPOSE 35000-40000/udp
 
-# Çevre değişkenleri
+# Ortam değişkenleri
 ENV EVENT_PORT=50060
 ENV CONFIG_FILE=/app/config.ini
 
-# Çalıştırma komutu
+# Uygulama çalıştır
 CMD ["python3", "-u", "src/main.py"]
