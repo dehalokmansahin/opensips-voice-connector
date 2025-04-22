@@ -4,10 +4,13 @@ FROM python:3.10-slim-buster
 WORKDIR /app
 
 # Tüm proje dosyalarını (src, requirements.txt, config.ini vs.) kopyala
+
 COPY . /app/
 
 # Gereksinimleri yükle
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+
 
 # Gerekli portlar
 EXPOSE 5060/udp
